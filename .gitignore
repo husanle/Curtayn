@@ -1,0 +1,17 @@
+.gradle/
+.kotlin/
+.idea/
+build/
+local.properties
+*.iml
+*.jks
+*.keystore
+*.p12
+*.apk
+*.aab
+*.idsig
+.env
+.env.*
+/.codex/
+/research/
+/promo/
