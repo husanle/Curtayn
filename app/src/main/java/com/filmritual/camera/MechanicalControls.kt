@@ -171,8 +171,8 @@ internal fun MechanicalDeck(app: MainActivity, textures: BodyTextures?, openStop
                 rotationZ = swing
             }.semantics {
                 role = Role.Button
-                contentDescription = "过片拨杆 " + style.title
-                if (canWind) onClick("过片") { app.wind(); true } else disabled()
+                contentDescription = app.text("过片拨杆 " + style.title)
+                if (canWind) onClick(app.text("过片")) { app.wind(); true } else disabled()
             },
             contentScale = ContentScale.FillBounds
         )
@@ -197,9 +197,9 @@ private fun MechanicalShutter(app: MainActivity, enabled: Boolean, modifier: Mod
     Image(
         painterResource(style.artwork), null,
         modifier.clip(CircleShape).semantics {
-            contentDescription = "快门 " + style.title
+            contentDescription = app.text("快门 ") + style.title
             role = Role.Button
-            if (enabled) onClick("拍照") { app.preFocus(); app.shoot(); true } else disabled()
+            if (enabled) onClick(app.text("拍照")) { app.preFocus(); app.shoot(); true } else disabled()
         }.pointerInput(enabled) {
             if (!enabled) return@pointerInput
             awaitEachGesture {
@@ -235,8 +235,8 @@ private fun IsoDial(app: MainActivity, diameter: Dp, openStops: () -> Unit, modi
     Box(modifier.size(diameter).clip(CircleShape)
         .semantics {
             role = Role.Button
-            contentDescription = "颗粒感光度 ISO " + app.filmIso
-            if (active) onClick("选择 ISO 档位") { openStops(); true } else disabled()
+            contentDescription = app.text("颗粒感光度 ISO ") + app.filmIso
+            if (active) onClick(app.text("选择 ISO 档位")) { openStops(); true } else disabled()
         }
         .pointerInput(active) {
             if (active) detectTapGestures(onTap = { openStops() })
@@ -272,7 +272,7 @@ private fun IsoDial(app: MainActivity, diameter: Dp, openStops: () -> Unit, modi
             Box(Modifier.offset(diameter * (spec.window.x - .124f), diameter * (spec.window.y - .073f))
                 .size(diameter * .248f, diameter * .146f).graphicsLayer { rotationZ = spec.textTilt },
                 contentAlignment = Alignment.Center) {
-                Text(app.filmIso.toString(), color = Color(0xffe3e0d6), fontFamily = FontFamily.Monospace,
+                FilmText(app.filmIso.toString(), color = Color(0xffe3e0d6), fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold, fontSize = digitSize,
                     maxLines = 1, softWrap = false)
             }

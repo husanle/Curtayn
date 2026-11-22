@@ -145,7 +145,7 @@ internal fun ControlPlate(finish: BodyFinish, textures: BodyTextures?, modifier:
 }
 
 internal fun Modifier.viewfinderBezel(finish: BodyFinish, textures: BodyTextures?): Modifier =
-    clip(RoundedCornerShape(11.dp))
+    clip(RoundedCornerShape(7.dp))
         .background(Color(0xff17191a))
         .texture(textures?.get(if (finish.grip == BodyTexture.RESIN) finish.grip else finish.trim), 310)
         .drawWithCache {
@@ -165,9 +165,9 @@ internal fun Modifier.viewfinderBezel(finish: BodyFinish, textures: BodyTextures
                     drawRoundRect(brush, Offset(inset, inset), Size(size.width - inset * 2, size.height - inset * 2),
                         CornerRadius(radiusDp.dp.toPx()), style = Stroke(strokeDp.dp.toPx()))
                 }
-                drawRoundRect(Color.Black.copy(alpha = .46f), cornerRadius = CornerRadius(11.dp.toPx()))
-                ring(.9f, 10f, 1.5f, outer)
-                ring(3.9f, 7.3f, 3.3f, bevel)
+                drawRoundRect(Color.Black.copy(alpha = .46f), cornerRadius = CornerRadius(7.dp.toPx()))
+                ring(.55f, 6.5f, 1f, outer)
+                ring(1.5f, 5.5f, .8f, bevel)
             }
         }
 

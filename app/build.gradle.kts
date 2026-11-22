@@ -10,8 +10,8 @@ android {
         applicationId = "com.filmritual.camera"
         minSdk = 30
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.3.4"
+        versionCode = 13
+        versionName = "0.3.9"
     }
     buildFeatures { compose = true }
     androidResources { noCompress += "wav" }

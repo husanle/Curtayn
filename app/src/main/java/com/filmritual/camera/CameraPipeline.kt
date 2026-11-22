@@ -71,7 +71,27 @@ class CameraPipeline(
     private var unavailable = emptySet<Int>()
     private var detached = false
     private var captureInProgress = false
+    private var deviceRotation = android.view.Surface.ROTATION_0
+    private val orientationListener = object : android.view.OrientationEventListener(context) {
+        override fun onOrientationChanged(orientation: Int) {
+            val rotation = captureRotation(orientation) ?: return
+            if (deviceRotation == rotation) return
+            deviceRotation = rotation
+            if (!captureInProgress) capture?.targetRotation = rotation
+        }
+    }
     private var attempt = 0
+    private var compatibleZoom = false
+    private var zoomRequest = 0
+    private var previewReady = false
+    private var zoomPending = false
+    private var diagnosticCatalog = ""
+    private var diagnosticAt = 0L
+    private val metering = PreviewMetering(view, main, { status ->
+        if (!closed && state.metering != status) show(state.copy(metering = status))
+    }, { ev ->
+        if (!closed && state.meteringEv != ev) show(state.copy(meteringEv = ev))
+    })
     @Volatile private var frameGeneration = -1
     private var soundRequired = false
     private val mandatorySound = MediaActionSound().apply { load(MediaActionSound.SHUTTER_CLICK) }
@@ -82,18 +102,75 @@ class CameraPipeline(
             frameGeneration = -1
             main.execute {
                 if (!closed && generation == token && capture != null) {
-                    if (state.current != null) lastReady = state.current
-                    show(state.copy(ready = true, message = null))
+                    previewReady = true
+                    if (!zoomPending) {
+                        if (state.current != null) lastReady = state.current
+                        show(state.copy(ready = true, message = null))
+                    }
                 }
             }
         }
+    }.apply {
+        onLuminance = { token, grid -> main.execute {
+            if (!closed && generation == token && !captureInProgress && !zoomPending) metering.onLuminance(grid)
+        } }
     }
 
     fun setFilm(film: FilmRender) { renderer.film = film }
 
+    fun setCompatibleZoom(enabled: Boolean) {
+        if (captureInProgress || compatibleZoom == enabled) return
+        compatibleZoom = enabled
+        zoomRequest++
+        updateAvailable()
+        if (provider != null) switchTo(mainLens ?: 0, force = true)
+    }
+
+    private fun zoomFocals(): Set<Int> {
+        val source = provider ?: return paths.keys
+        val base = fallbackPrimary?.equivalent?.takeIf { it.isFinite() && it > 0 } ?: return paths.keys
+        val info = runCatching { source.getCameraInfo(CameraSelector.DEFAULT_BACK_CAMERA) }.getOrNull() ?: return paths.keys
+        val range = info.zoomState.value ?: return paths.keys
+        return compatibleFocals(base, range.minZoomRatio, range.maxZoomRatio, paths.keys)
+    }
+
+    private fun updateAvailable() {
+        show(state.copy(available = if (compatibleZoom) zoomFocals() else paths.keys - unavailable))
+    }
+
+    private fun changeZoom(equivalent: Int): Boolean {
+        val session = camera ?: return false
+        val base = fallbackPrimary?.equivalent?.takeIf { it.isFinite() && it > 0 } ?: return false
+        val range = session.cameraInfo.zoomState.value ?: return false
+        val ratio = (equivalent / base).toFloat().coerceIn(range.minZoomRatio, range.maxZoomRatio)
+        val request = ++zoomRequest
+        val previous = state.current
+        zoomPending = true
+        show(state.copy(ready = false, message = "正在打开镜头…"))
+        val future = session.cameraControl.setZoomRatio(ratio)
+        future.addListener({
+            if (closed || request != zoomRequest || session != camera) return@addListener
+            zoomPending = false
+            if (runCatching { future.get() }.isSuccess) {
+                val actual = kotlin.math.round(base * ratio).toInt()
+                if (previewReady) lastReady = actual
+                show(state.copy(ready = previewReady, current = actual, message = null))
+            } else show(state.copy(ready = previewReady, current = previous, message = "变焦失败"))
+        }, main)
+        return true
+    }
+
+    fun setMetering(mode: MeteringMode, target: Pair<Float, Float>?) {
+        metering.set(mode, target)
+        renderer.requestMeteringSample(mode)
+        if (state.ready && !captureInProgress) metering.apply()
+    }
+
     fun start() {
         if (starting || closed || view.viewPort == null) return
         starting = true
+        deviceRotation = view.display?.rotation ?: android.view.Surface.ROTATION_0
+        if (orientationListener.canDetectOrientation()) orientationListener.enable()
         val task = ProcessCameraProvider.getInstance(context)
         task.addListener({
             if (closed) return@addListener
@@ -115,10 +192,10 @@ class CameraPipeline(
                 val metadata = runCatching { manager.getCameraCharacteristics(parent) }.getOrNull() ?: continue
                 val standalone = runCatching { toPath(metadata, parent, null) }.getOrNull()
                 if (parent == primary) fallbackPrimary = standalone ?: CameraPath(parent, null, Double.NaN, Float.NaN)
-                if ((parent == primary || metadata.physicalCameraIds.isEmpty()) && standalone != null) add(standalone)
+                if (standalone != null) add(standalone)
                 for (physical in metadata.physicalCameraIds) {
                     val info = runCatching { manager.getCameraCharacteristics(physical) }.getOrNull() ?: continue
-                    runCatching { toPath(info, parent, physical) }.getOrNull()?.let(::add)
+                    runCatching { toPath(info, parent, physical, metadata) }.getOrNull()?.let(::add)
                 }
             }
         }
@@ -126,11 +203,16 @@ class CameraPipeline(
         mainLens = fallbackPrimary?.takeIf { it.equivalent.isFinite() }?.let { primaryPath ->
             paths.entries.firstOrNull { primaryPath in it.value }?.key
         }
-        show(state.copy(available = paths.filterValues { it.isNotEmpty() }.keys))
+        diagnosticCatalog = candidates.joinToString("\n") { "logical=${it.parent} physical=${it.physical ?: "auto"} eq=${"%.1f".format(Locale.US, it.equivalent)}mm focal=${it.focal}mm" }
+        show(state.copy(diagnostics = diagnosticCatalog))
+        updateAvailable()
     }
 
-    private fun toPath(info: CameraCharacteristics, parent: String, physical: String?): CameraPath? {
-        val streamMap = info.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
+    private fun toPath(info: CameraCharacteristics, parent: String, physical: String?, fallback: CameraCharacteristics? = null): CameraPath? {
+        val ownMap = info.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val streamMap = ownMap?.takeIf { !it.getOutputSizes(ImageFormat.JPEG).isNullOrEmpty() ||
+            !it.getHighResolutionOutputSizes(ImageFormat.JPEG).isNullOrEmpty() }
+            ?: fallback?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return null
         if (streamMap.getOutputSizes(ImageFormat.JPEG).isNullOrEmpty() &&
             streamMap.getHighResolutionOutputSizes(ImageFormat.JPEG).isNullOrEmpty()) return null
         val sensor = info.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return null
@@ -139,10 +221,12 @@ class CameraPipeline(
         return CameraPath(parent, physical, equivalent, focal).takeIf { equivalent.isFinite() }
     }
 
-    fun switchTo(equiv: Int) {
-        if (closed || captureInProgress || (state.ready && state.current == equiv)) return
+    fun switchTo(equiv: Int, force: Boolean = false) {
+        if (closed || captureInProgress || (!force && state.ready && state.current == equiv)) return
         val source = provider ?: return
-        val candidates = paths[equiv].orEmpty().takeUnless { equiv in unavailable }.orEmpty()
+        if (!force && compatibleZoom && active == fallbackPrimary && changeZoom(equiv)) return
+        zoomRequest++
+        val candidates = if (compatibleZoom) listOfNotNull(fallbackPrimary) else paths[equiv].orEmpty().takeUnless { equiv in unavailable }.orEmpty()
         if (candidates.isEmpty() && (state.ready || (equiv != mainLens && equiv != 0))) return
         attempt++
         val request = attempt
@@ -164,12 +248,15 @@ class CameraPipeline(
                 }
             }
             frameGeneration = -1
+            previewReady = false
+            zoomPending = false
             camera = null
+            metering.bind(null)
             capture = null
             active = null
             val token = ++generation
             show(state.copy(ready = false, current = path?.let { equiv }, available = state.available - unavailable,
-                exposure = Exposure.UNKNOWN, stillSize = null, message = "正在打开镜头…"))
+                exposure = Exposure.UNKNOWN, stillSize = null, metering = MeteringStatus.WAITING, message = "正在打开镜头…"))
             val selector = CameraSelector.Builder().addCameraFilter { infos -> infos.filter { Camera2CameraInfo.from(it).cameraId == selected.parent } }
                 .apply { selected.physical?.let { setPhysicalCameraId(it) } }.build()
             val previewBuilder = Preview.Builder().setResolutionSelector(
@@ -177,6 +264,7 @@ class CameraPipeline(
                     .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                     .build()
             )
+            selected.physical?.let { Camera2Interop.Extender(previewBuilder).setPhysicalCameraId(it) }
             Camera2Interop.Extender(previewBuilder).setSessionCaptureCallback(object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(session: CameraCaptureSession, captureRequest: android.hardware.camera2.CaptureRequest, result: TotalCaptureResult) {
                     val ae = when (result.get(CaptureResult.CONTROL_AE_STATE)) {
@@ -185,11 +273,32 @@ class CameraPipeline(
                         CaptureResult.CONTROL_AE_STATE_SEARCHING, CaptureResult.CONTROL_AE_STATE_PRECAPTURE -> Exposure.METERING
                         else -> Exposure.UNKNOWN
                     }
-                    main.execute { if (!closed && generation == token && ae != state.exposure) show(state.copy(exposure = ae)) }
+                    val crop = result.get(CaptureResult.SCALER_CROP_REGION)
+                    val physicalId = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
+                    @Suppress("DEPRECATION")
+                    val physicalResults = result.physicalCameraResults
+                    val outputResult = selected.physical?.let { physicalResults[it] } ?: result
+                    val focal = outputResult.get(CaptureResult.LENS_FOCAL_LENGTH)
+                    val actualZoom = result.get(CaptureResult.CONTROL_ZOOM_RATIO)
+                    val exposureNs = outputResult.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                    val sensorIso = outputResult.get(CaptureResult.SENSOR_SENSITIVITY)
+                    main.execute {
+                        if (!closed && generation == token) {
+                            if (ae != state.exposure) show(state.copy(exposure = ae))
+                            if (!captureInProgress) metering.onFrame(crop,
+                                outputResult.get(CaptureResult.CONTROL_AE_REGIONS) ?: result.get(CaptureResult.CONTROL_AE_REGIONS),
+                                result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION))
+                            if (android.os.SystemClock.elapsedRealtime() - diagnosticAt > 1200) {
+                                diagnosticAt = android.os.SystemClock.elapsedRealtime()
+                                show(state.copy(diagnostics = "mode=${if (compatibleZoom) "logical zoom" else "physical"}\nrequested=${selected.parent}/${selected.physical ?: "auto"}\nactivePhysical=${physicalId ?: "not reported"}\nphysicalResults=${physicalResults.keys.joinToString().ifBlank { "not reported" }}\nfocal=${focal ?: "not reported"}mm zoom=${actualZoom ?: 1f}\nexposureNs=$exposureNs sensorIso=$sensorIso stillRotation=$deviceRotation\n" + metering.diagnostics + diagnosticCatalog))
+                            }
+                        }
+                    }
                 }
             })
             val preview = previewBuilder.build().also { it.setSurfaceProvider(view.surfaceProvider) }
-            val still = ImageCapture.Builder().setJpegQuality(96)
+            val stillBuilder = ImageCapture.Builder().setJpegQuality(96)
+                .setTargetRotation(deviceRotation)
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
                 .setResolutionSelector(ResolutionSelector.Builder()
                     .setAllowedResolutionMode(if (highResolution) ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE
@@ -197,7 +306,8 @@ class CameraPipeline(
                     .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
                     .setResolutionFilter { sizes, _ -> sizes.sortedByDescending { it.width.toLong() * it.height } }
                     .build())
-                .build()
+            selected.physical?.let { Camera2Interop.Extender(stillBuilder).setPhysicalCameraId(it) }
+            val still = stillBuilder.build()
             val group = UseCaseGroup.Builder().addUseCase(preview).addUseCase(still).addEffect(renderer.effect(token)).build()
             frameGeneration = token
             runCatching {
@@ -205,9 +315,19 @@ class CameraPipeline(
                 source.bindToLifecycle(lifecycle, selector, group)
             }.onSuccess {
                 camera = it
+                val physicalLimit = selected.physical?.let { id ->
+                    runCatching {
+                        context.getSystemService(CameraManager::class.java).getCameraCharacteristics(id)
+                            .get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE)
+                    }.getOrNull()
+                }
+                metering.bind(it, physicalLimit)
                 active = path
                 capture = still
-                show(state.copy(stillSize = still.resolutionInfo?.resolution))
+                show(state.copy(stillSize = still.resolutionInfo?.resolution,
+                    photoRotation = it.cameraInfo.getSensorRotationDegrees(view.display?.rotation ?: android.view.Surface.ROTATION_0)))
+                updateAvailable()
+                if (compatibleZoom) changeZoom(equiv.takeIf { it > 0 } ?: mainLens ?: 1)
                 soundRequired = CameraInfo.mustPlayShutterSound()
                 handler.postDelayed({
                     if (!closed && generation == token && !state.ready) {
@@ -225,12 +345,12 @@ class CameraPipeline(
         if (!state.ready || captureInProgress || view.width == 0 || view.height == 0) return
         runCatching {
             val point = view.meteringPointFactory.createPoint(x.coerceIn(0f, view.width.toFloat()), y.coerceIn(0f, view.height.toFloat()))
-            camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+            camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
                 .setAutoCancelDuration(3, TimeUnit.SECONDS).build())
         }
     }
 
-    fun shoot(film: FilmRender, edge: FilmEdge?, onExposed: () -> Unit, onDone: (Result<SavedFrame>) -> Unit): Boolean {
+    fun shoot(film: FilmRender, edge: FilmEdge?, imprint: DateImprint?, onExposed: () -> Unit, onDone: (Result<SavedFrame>) -> Unit): Boolean {
         val session = capture ?: return false
         if (!state.ready || captureInProgress || closed) return false
         captureInProgress = true
@@ -239,6 +359,7 @@ class CameraPipeline(
         val required = soundRequired
         fun done(result: Result<SavedFrame>) = main.execute {
             captureInProgress = false
+            if (!closed) capture?.targetRotation = deviceRotation
             if (!closed) onDone(result)
             if (detached) release()
         }
@@ -253,7 +374,7 @@ class CameraPipeline(
                 override fun onCaptureSuccess(image: ImageProxy) {
                     val captured = runCatching { image.use(::readJpeg) }
                     val frame = captured.getOrElse { done(Result.failure(it)); return }
-                    renderer.render(frame.bytes, frame.rotation, film, edge) { result ->
+                    renderer.render(frame.bytes, frame.rotation, film, edge, imprint) { result ->
                         io.execute {
                             done(result.mapCatching { filtered ->
                                 try { save(filtered, frame.exif, equivalent, path, film) } finally { filtered.recycle() }
@@ -269,6 +390,7 @@ class CameraPipeline(
         }
         return true
     }
+
 
     private fun readJpeg(image: ImageProxy): CapturedJpeg {
         require(image.format == ImageFormat.JPEG) { "相机没有返回 JPEG" }
@@ -288,7 +410,7 @@ class CameraPipeline(
             val exif = ExifInterface(temp)
             val tags = listOf(ExifInterface.TAG_DATETIME_ORIGINAL, ExifInterface.TAG_DATETIME_DIGITIZED, ExifInterface.TAG_EXPOSURE_TIME,
                 ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, ExifInterface.TAG_F_NUMBER, ExifInterface.TAG_MAKE, ExifInterface.TAG_MODEL,
-                ExifInterface.TAG_FOCAL_LENGTH)
+                ExifInterface.TAG_FOCAL_LENGTH, ExifInterface.TAG_EXPOSURE_BIAS_VALUE)
             for (tag in tags) original?.getAttribute(tag)?.let { exif.setAttribute(tag, it) }
             exif.setAttribute(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL.toString())
             val appName = context.getString(R.string.app_name)
@@ -297,7 +419,8 @@ class CameraPipeline(
                 look.film.label + " / simulated grain ISO " + look.iso)
             if (equivalent != null && path != null) {
                 exif.setAttribute(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, equivalent.toString())
-                exif.setAttribute(ExifInterface.TAG_FOCAL_LENGTH, (path.focal * 1000).toInt().toString() + "/1000")
+                if (original?.getAttribute(ExifInterface.TAG_FOCAL_LENGTH) == null)
+                    exif.setAttribute(ExifInterface.TAG_FOCAL_LENGTH, (path.focal * 1000).toInt().toString() + "/1000")
             }
             exif.saveAttributes()
             val values = ContentValues().apply {
@@ -324,7 +447,9 @@ class CameraPipeline(
 
     fun close() {
         closed = true
+        orientationListener.disable()
         detached = true
+        metering.close()
         provider?.unbindAll()
         handler.removeCallbacksAndMessages(null)
         if (!captureInProgress) release()
@@ -337,5 +462,7 @@ class CameraPipeline(
 
 enum class Exposure { UNKNOWN, METERING, READY, LOW }
 data class CameraState(val ready: Boolean = false, val current: Int? = null, val available: Set<Int> = emptySet(),
-    val message: String? = null, val exposure: Exposure = Exposure.UNKNOWN, val stillSize: Size? = null)
+    val message: String? = null, val exposure: Exposure = Exposure.UNKNOWN, val stillSize: Size? = null,
+    val metering: MeteringStatus = MeteringStatus.WAITING, val meteringEv: Float? = null,
+    val photoRotation: Int = 90, val diagnostics: String = "")
 data class SavedFrame(val uri: Uri, val thumb: Bitmap, val width: Int, val height: Int)

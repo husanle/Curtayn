@@ -46,22 +46,23 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
-private val ink = Color(0xff141412)
-private val deck = Color(0xff1c1c19)
-private val line = Color(0xff403c32)
-private val paper = Color(0xfff0e8d6)
-private val muted = Color(0xffaaa390)
-private val brass = Color(0xffd9b475)
+internal val ink = Color(0xff141412)
+internal val deck = Color(0xff1c1c19)
+internal val line = Color(0xff403c32)
+internal val paper = Color(0xfff0e8d6)
+internal val muted = Color(0xffaaa390)
+internal val brass = Color(0xffd9b475)
 private val signal = Color(0xffda654c)
-private val shape = RoundedCornerShape(10.dp)
-private val mono = FontFamily.Monospace
+internal val shape = RoundedCornerShape(10.dp)
+internal val mono = FontFamily.Monospace
 
 @Composable
 fun CameraScreen(app: MainActivity) {
     var settings by remember { mutableStateOf(false) }
+    var info by remember { mutableStateOf(false) }
     var original by remember { mutableStateOf<Film?>(null) }
-    BackHandler(app.picker != null || settings || original != null) {
-        when { original != null -> original = null; settings -> settings = false; else -> app.cancelPicker() }
+    BackHandler(app.picker != null || settings || info || original != null) {
+        when { info -> info = false; original != null -> original = null; settings -> settings = false; else -> app.cancelPicker() }
     }
     val scheme = darkColorScheme(primary = brass, onPrimary = ink, background = ink, onBackground = paper,
         surface = deck, onSurface = paper, outline = line, secondary = muted)
@@ -69,14 +70,16 @@ fun CameraScreen(app: MainActivity) {
     MaterialTheme(colorScheme = scheme) {
         Box(Modifier.fillMaxSize().background(ink)) {
             CameraBody(app.shutter.finish, textures, Modifier.matchParentSize())
-            Column(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 7.dp)) {
+            Column(Modifier.fillMaxSize().safeDrawingPadding().padding(horizontal = 4.dp)) {
                 Row(Modifier.fillMaxWidth().padding(start = 3.dp, end = 3.dp, top = 5.dp, bottom = 6.dp),
                     verticalAlignment = Alignment.CenterVertically) {
                     Image(painterResource(R.drawable.curtayn_emblem), null,
                         Modifier.size(34.dp).clip(shape).background(colorResource(R.color.curtayn_steel_background)))
                     Spacer(Modifier.width(9.dp))
-                    Text(stringResource(R.string.app_name), Modifier.weight(1f), color = Color(0xffe0eaf0),
+                    FilmText(stringResource(R.string.app_name), Modifier.weight(1f), color = Color(0xffe0eaf0),
                         fontSize = 20.sp, fontWeight = FontWeight.SemiBold, letterSpacing = .65.sp)
+                    Control("Info", { info = true }, selected = info)
+                    Spacer(Modifier.width(5.dp))
                     Control("设置", { settings = true }, selected = settings)
                 }
                 Viewfinder(app, textures, Modifier.weight(1f))
@@ -86,6 +89,7 @@ fun CameraScreen(app: MainActivity) {
             }
         }
         if (settings) SettingsDialog(app) { settings = false }
+        if (info) InfoDialog(app) { info = false }
         original?.let { ReferenceDialog(app, it) { original = null } }
     }
 }
@@ -98,7 +102,7 @@ private fun Viewfinder(app: MainActivity, textures: BodyTextures?, modifier: Mod
     LaunchedEffect(focusCount) { if (focusCount > 0) { delay(780); focus = null } }
     LaunchedEffect(app.flash) { if (app.flash > 0) { flash = true; delay(85); flash = false } }
     BoxWithConstraints(modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-        val lip = 6.dp
+        val lip = 2.dp
         val opening = minOf(maxWidth - lip * 2, (maxHeight - lip * 2) * .75f)
         val glass = RoundedCornerShape(5.dp)
         if (opening > 0.dp) {
@@ -106,7 +110,11 @@ private fun Viewfinder(app: MainActivity, textures: BodyTextures?, modifier: Mod
                 .viewfinderBezel(app.shutter.finish, textures).padding(lip)) {
                 Box(Modifier.fillMaxSize().clip(glass).background(Color(0xff070809))) {
                     AndroidView(factory = { app.preview }, modifier = Modifier.matchParentSize())
-                    FinderOverlay(app.finder, app.camera.exposure, focus, Modifier.matchParentSize().pointerInput(app) {
+                    if (app.imprintStyle != ImprintStyle.OFF) ImprintPreview(app, Modifier.matchParentSize())
+                    val spot = if (app.camera.ready && app.camera.metering != MeteringStatus.SYSTEM && app.meteringMode == MeteringMode.SPOT) {
+                        MeteringMode.SPOT.zones(app.meteringSpot, 1).first()
+                    } else null
+                    FinderOverlay(app.finder, app.camera.exposure, focus, spot, Modifier.matchParentSize().pointerInput(app) {
                         detectTapGestures { point ->
                             if (app.camera.ready) { focus = point; focusCount++; app.focus(point.x, point.y) }
                         }
@@ -114,16 +122,17 @@ private fun Viewfinder(app: MainActivity, textures: BodyTextures?, modifier: Mod
                     Box(Modifier.matchParentSize().border(1.dp, Color.Black.copy(alpha = .74f), glass))
                     Row(Modifier.fillMaxWidth().padding(8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
                         Badge(app.finder.style)
-                        Badge(app.camera.current?.let { it.toString() + " mm EQ" } ?: "AUTO")
+                        Badge((app.camera.current?.let { it.toString() + " mm EQ" } ?: "AUTO") + if (app.compatibleZoom) " · Z" else "")
                     }
+                    Box(Modifier.align(Alignment.BottomEnd).padding(8.dp)) { MeteringControl(app) }
                     if (app.shaky && app.camera.ready) {
                         Box(Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp)) { Badge("请稳住手机", signal) }
                     }
                     if (flash) Box(Modifier.matchParentSize().background(Color.White.copy(alpha = .78f)))
                     if (!app.permitted || !app.camera.ready) Column(Modifier.align(Alignment.Center)
                         .background(ink.copy(alpha = .9f), shape).padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(if (app.permitted) app.camera.message ?: "准备取景…" else "相机权限未开启", color = paper, fontSize = 13.sp)
-                        if (!app.permitted) TextButton(onClick = app::permission) { Text("允许使用相机") }
+                        FilmText(if (app.permitted) app.camera.message ?: "准备取景…" else "相机权限未开启", color = paper, fontSize = 13.sp)
+                        if (!app.permitted) TextButton(onClick = app::permission) { FilmText("允许使用相机") }
                     }
                 }
             }
@@ -132,7 +141,7 @@ private fun Viewfinder(app: MainActivity, textures: BodyTextures?, modifier: Mod
 }
 
 @Composable
-private fun FinderOverlay(finder: Finder, exposure: Exposure, focus: Offset?, modifier: Modifier) {
+private fun FinderOverlay(finder: Finder, exposure: Exposure, focus: Offset?, spot: MeteringZone?, modifier: Modifier) {
     Canvas(modifier) {
         val border = when (finder) {
             Finder.LEICA, Finder.CANON -> Color(0xffefe1ba)
@@ -203,6 +212,10 @@ private fun FinderOverlay(finder: Finder, exposure: Exposure, focus: Offset?, mo
             }
         }
         focus?.let { drawCircle(brass, radius * .72f, it, style = Stroke(1.8.dp.toPx())) }
+        spot?.let {
+            drawRect(brass, Offset(it.left * size.width, it.top * size.height),
+                Size((it.right - it.left) * size.width, (it.bottom - it.top) * size.height), style = Stroke(1.5.dp.toPx()))
+        }
     }
 }
 
@@ -217,7 +230,7 @@ private fun LensBar(app: MainActivity) {
                 { choosing = true }, selected = app.camera.current != null, enabled = enabled)
             DropdownMenu(expanded = choosing, onDismissRequest = { choosing = false }) {
                 for (focal in focalLengths) {
-                    DropdownMenuItem(text = { Text("${focal} mm 等效") }, onClick = {
+                    DropdownMenuItem(text = { FilmText("${focal} mm 等效") }, onClick = {
                         choosing = false
                         app.chooseLens(focal)
                     })
@@ -231,7 +244,7 @@ private fun LensBar(app: MainActivity) {
             val selected = app.camera.current == focal
             Box(Modifier.size(43.dp, 38.dp).clip(RoundedCornerShape(5.dp))
                 .background(if (selected) brass else ink).border(1.dp, if (selected) brass else line, RoundedCornerShape(5.dp))
-                .semantics { contentDescription = "${focal} 毫米等效" }
+                .semantics { contentDescription = app.text("${focal} 毫米等效") }
                 .clickable(enabled = enabled, role = Role.Button) { app.chooseLens(focal) }, contentAlignment = Alignment.Center) {
                 Engraving("${focal}mm", if (selected) ink else paper, 11)
             }
@@ -247,12 +260,12 @@ private fun ShootingDeck(app: MainActivity, textures: BodyTextures?) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
             val film = app.roll.film
             Box(Modifier.size(40.dp).clip(shape).clickable(enabled = app.roll.phase != Phase.CAPTURING,
-                role = Role.Button, onClickLabel = "选胶卷") { app.inspectFilm(film) }) {
+                role = Role.Button, onClickLabel = app.text("选胶卷")) { app.inspectFilm(film) }) {
                 FilmArt(app, film, Modifier.fillMaxSize())
             }
             Column(Modifier.weight(1f).padding(horizontal = 6.dp)) {
-                Text(film.label, color = paper, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(app.notice ?: when (app.roll.phase) {
+                FilmText(film.label, color = paper, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                FilmText(app.notice ?: app.camera.message ?: when (app.roll.phase) {
                     Phase.NEEDS_WIND -> "拨杆过片"
                     Phase.ARMED -> "按住对焦，松手拍"
                     Phase.CAPTURING -> "正在冲印…"
@@ -260,7 +273,7 @@ private fun ShootingDeck(app: MainActivity, textures: BodyTextures?) {
             }
             LensBar(app)
             Spacer(Modifier.width(4.dp))
-            Box(Modifier.size(42.dp).clickable(enabled = app.saved != null, role = Role.Button, onClickLabel = "查看相片") {
+            Box(Modifier.size(42.dp).clickable(enabled = app.saved != null, role = Role.Button, onClickLabel = app.text("查看相片")) {
                 app.openLast()
             }, contentAlignment = Alignment.Center) {
                 app.saved?.thumb?.let {
@@ -281,17 +294,17 @@ private fun ShootingDeck(app: MainActivity, textures: BodyTextures?) {
 private fun IsoDialog(app: MainActivity, dismiss: () -> Unit) {
     Dialog(dismiss) {
         Column(Modifier.clip(shape).background(deck).verticalScroll(rememberScrollState()).padding(16.dp)) {
-            Text("胶片感光度", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-            Text("颗粒随档位变粗。手机曝光由相机自动控制。", color = muted, fontSize = 12.sp)
+            FilmText("胶片感光度", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            FilmText("颗粒随档位变粗。手机曝光由相机自动控制。", color = muted, fontSize = 12.sp)
             Spacer(Modifier.height(12.dp))
             for (row in (isoStops + app.roll.film.iso).distinct().sorted().chunked(3)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                     for (iso in row) TextButton(onClick = { app.chooseIso(iso); dismiss() }) {
-                        Text(iso.toString(), color = if (iso == app.filmIso) brass else paper, fontFamily = mono)
+                        FilmText(iso.toString(), color = if (iso == app.filmIso) brass else paper, fontFamily = mono)
                     }
                 }
             }
-            TextButton({ app.chooseIso(app.roll.film.iso); dismiss() }) { Text("使用胶卷原档 · " + app.roll.film.iso) }
+            TextButton({ app.chooseIso(app.roll.film.iso); dismiss() }) { FilmText("使用胶卷原档 · " + app.roll.film.iso) }
         }
     }
 }
@@ -306,8 +319,8 @@ private fun FilmArt(app: MainActivity, film: Film, modifier: Modifier) {
     }
     val bitmap = prepared ?: image
     Box(modifier.background(Color(0xff292820)), contentAlignment = Alignment.Center) {
-        if (bitmap != null) Image(bitmap.asImageBitmap(), film.label + " · " + film.format, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-        else Text(film.label, color = paper, fontSize = 10.sp, modifier = Modifier.padding(5.dp))
+        if (bitmap != null) Image(bitmap.asImageBitmap(), app.text(film.label + " · " + film.format), Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+        else FilmText(film.label, color = paper, fontSize = 10.sp, modifier = Modifier.padding(5.dp))
     }
 }
 
@@ -322,7 +335,7 @@ private fun FilmDeck(app: MainActivity, onOriginal: (Film) -> Unit) {
     }
     Column(Modifier.fillMaxWidth().padding(top = 7.dp, bottom = 8.dp).clip(shape).background(deck).border(1.dp, line, shape).padding(9.dp)) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text("胶卷", color = paper, fontWeight = FontWeight.Bold, fontSize = 17.sp, modifier = Modifier.weight(1f))
+            FilmText("胶卷", color = paper, fontWeight = FontWeight.Bold, fontSize = 17.sp, modifier = Modifier.weight(1f))
             Engraving(shown.size.toString() + " 卷", muted, 10)
         }
         Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 6.dp),
@@ -337,15 +350,15 @@ private fun FilmDeck(app: MainActivity, onOriginal: (Film) -> Unit) {
                 Column(Modifier.width(97.dp).clip(shape).background(ink).border(if (selected) 2.dp else 1.dp,
                     if (selected) brass else line, shape).clickable(role = Role.Button) { app.inspectFilm(film) }.padding(5.dp)) {
                     FilmArt(app, film, Modifier.fillMaxWidth().height(76.dp).clip(RoundedCornerShape(4.dp)))
-                    Text(film.label, color = if (selected) brass else paper, fontSize = 10.sp, maxLines = 1,
+                    FilmText(film.label, color = if (selected) brass else paper, fontSize = 10.sp, maxLines = 1,
                         overflow = TextOverflow.Ellipsis)
-                    Text(film.badge, color = muted, fontSize = 9.sp, maxLines = 1)
+                    FilmText(film.badge, color = muted, fontSize = 9.sp, maxLines = 1)
                 }
             }
         }
-        Text(current.label, color = paper, fontWeight = FontWeight.SemiBold, fontSize = 13.sp,
+        FilmText(current.label, color = paper, fontWeight = FontWeight.SemiBold, fontSize = 13.sp,
             modifier = Modifier.padding(top = 7.dp))
-        Text(current.type + " · " + current.format + " · " + current.iso + " · " + current.badge,
+        FilmText(current.type + " · " + current.format + " · " + current.iso + " · " + current.badge,
             color = muted, fontSize = 10.sp)
         Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
             Control("实拍与来源", { onOriginal(current) })
@@ -366,15 +379,15 @@ private fun ReferenceDialog(app: MainActivity, film: Film, dismiss: () -> Unit) 
     Dialog(dismiss) {
         Column(Modifier.clip(shape).background(deck).verticalScroll(rememberScrollState()).padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(film.brand + " " + film.label, color = paper, fontWeight = FontWeight.Bold)
-            bitmap?.let { Image(it.asImageBitmap(), "胶卷或包装实拍", Modifier.fillMaxWidth().heightIn(max = 290.dp)
+            FilmText(film.brand + " " + film.label, color = paper, fontWeight = FontWeight.Bold)
+            bitmap?.let { Image(it.asImageBitmap(), app.text("胶卷或包装实拍"), Modifier.fillMaxWidth().heightIn(max = 290.dp)
                 .padding(vertical = 7.dp), contentScale = ContentScale.Fit) }
-            Text(film.credit, color = muted, fontSize = 12.sp)
-            Text(if (bitmap == null) "查看厂商资料" else "抽屉封面为实拍参考重绘。", color = muted, fontSize = 11.sp)
-            if (film.look != null) Text("使用独立制作的近似色彩曲线。", color = muted, fontSize = 11.sp)
+            FilmText(film.credit, color = muted, fontSize = 12.sp)
+            FilmText(if (bitmap == null) "查看厂商资料" else "抽屉封面为实拍参考重绘。", color = muted, fontSize = 11.sp)
+            if (film.look != null) FilmText("使用独立制作的近似色彩曲线。", color = muted, fontSize = 11.sp)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                TextButton({ app.openSource(film) }) { Text("来源页面") }
-                TextButton(dismiss) { Text("返回") }
+                TextButton({ app.openSource(film) }) { FilmText("来源页面") }
+                TextButton(dismiss) { FilmText("返回") }
             }
         }
     }
@@ -385,15 +398,15 @@ private fun SettingsDialog(app: MainActivity, dismiss: () -> Unit) {
     var category by remember { mutableIntStateOf(0) }
     Dialog(dismiss) {
         Column(Modifier.clip(shape).background(deck).padding(14.dp)) {
-            Text("机身设置", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                listOf("快门", "过片", "ISO", "取景器", "成片").forEachIndexed { index, title ->
+            FilmText("机身设置", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                listOf("快门", "过片", "ISO", "取景器", "成片", "语言 / Language").forEachIndexed { index, title ->
                     Control(title, { category = index }, selected = category == index)
                 }
             }
             if (category == 0 || category == 1 || category == 3) {
                 Toggle("锁定机身品牌", app.brandLocked, app::lockBrand)
-                Text("快门、拨杆和取景器一起切换", color = muted, fontSize = 11.sp)
+                FilmText("快门、拨杆和取景器一起切换", color = muted, fontSize = 11.sp)
             }
             Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
                 when (category) {
@@ -407,7 +420,7 @@ private fun SettingsDialog(app: MainActivity, dismiss: () -> Unit) {
                             Choice(shutter.title, detail + " · " + shutter.finish.label, app.shutter == shutter,
                                 shutter.artwork) { app.chooseShutter(shutter) }
                         }
-                        TextButton(app::hearShutter) { Text("试听快门") }
+                        TextButton(app::hearShutter) { FilmText("试听快门") }
                     }
                     1 -> {
                         for (advance in Advance.entries) {
@@ -416,64 +429,69 @@ private fun SettingsDialog(app: MainActivity, dismiss: () -> Unit) {
                                 app.chooseAdvance(advance)
                             }
                         }
-                        TextButton(app::hearAdvance) { Text("试听拨杆") }
+                        TextButton(app::hearAdvance) { FilmText("试听拨杆") }
                     }
                     2 -> {
                         for (dial in DialStyle.entries) {
                             Choice(dial.title, "ASA 刻度窗", app.dial == dial, dial.artwork) { app.chooseDial(dial) }
                         }
-                        TextButton(app::hearDial) { Text("试听 ISO 卡点") }
+                        TextButton(app::hearDial) { FilmText("试听 ISO 卡点") }
                     }
                     3 -> {
                         for (finder in Finder.entries) {
                             Choice(finder.title, finder.style, app.finder == finder) { app.chooseFinder(finder) }
                         }
                     }
-                    else -> {
+                    4 -> {
                         app.camera.stillSize?.let { size ->
-                            Text("镜头拍摄尺寸  ${maxOf(size.width, size.height)} × ${minOf(size.width, size.height)}",
+                            FilmText("镜头拍摄尺寸  ${maxOf(size.width, size.height)} × ${minOf(size.width, size.height)}",
                                 color = paper, fontSize = 13.sp)
                         }
                         app.saved?.let { last ->
-                            Text("最近成片  ${last.width} × ${last.height}", color = muted, fontSize = 12.sp)
+                            FilmText("最近成片  ${last.width} × ${last.height}", color = muted, fontSize = 12.sp)
                         }
                         Toggle("35mm 胶片齿孔", app.filmEdges, app::toggleFilmEdges)
-                        Text("随胶卷印上片名、已核对的型号代码、冲洗标记和帧号。即显片保留原画幅。",
+                        FilmText("随胶卷印上片名、已核对的型号代码、冲洗标记和帧号。即显片保留原画幅。",
                             color = muted, fontSize = 12.sp, modifier = Modifier.padding(bottom = 10.dp))
+                        ImprintSettings(app)
+                        HorizontalDivider(color = line)
+                        Toggle("兼容焦段切换", app.compatibleZoom, app::toggleCompatibleZoom)
+                        FilmText("使用逻辑相机变焦切换焦段，实际物理镜头由系统决定。适合物理镜头切换无效的机型。", color = muted, fontSize = 12.sp)
                     }
+                    5 -> LanguageSettings(app)
                 }
             }
             HorizontalDivider(color = line)
             Toggle("机械声音 · 媒体音量", app.audio, app::toggleAudio)
             Toggle("机械震感", app.haptics, app::toggleHaptic)
             if (app.haptics) {
-                Text("震感强度", fontSize = 12.sp, color = muted)
+                FilmText("震感强度", fontSize = 12.sp, color = muted)
                 Slider(app.hapticStrength, app::changeHapticStrength, valueRange = .35f..1f,
                     onValueChangeFinished = app::saveHapticStrength)
             }
             Toggle("手持晃动提示", app.motionEnabled, app::toggleMotion)
-            TextButton(onClick = dismiss, modifier = Modifier.align(Alignment.End)) { Text("完成") }
+            TextButton(onClick = dismiss, modifier = Modifier.align(Alignment.End)) { FilmText("完成") }
         }
     }
 }
 
 @Composable
-private fun Choice(label: String, detail: String, selected: Boolean, artwork: Int? = null, choose: () -> Unit) {
+internal fun Choice(label: String, detail: String, selected: Boolean, artwork: Int? = null, choose: () -> Unit) {
     Row(Modifier.fillMaxWidth().clickable(role = Role.RadioButton, onClick = choose).padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically) {
         RadioButton(selected, onClick = null, modifier = Modifier.padding(8.dp))
         if (artwork != null) Image(painterResource(artwork), null, Modifier.size(50.dp, 36.dp), contentScale = ContentScale.Fit)
         Column {
-            Text(label, color = paper, fontSize = 13.sp)
-            Text(detail, color = muted, fontSize = 10.sp)
+            FilmText(label, color = paper, fontSize = 13.sp)
+            FilmText(detail, color = muted, fontSize = 10.sp)
         }
     }
 }
 
 @Composable
-private fun Toggle(label: String, checked: Boolean, changed: (Boolean) -> Unit) {
+internal fun Toggle(label: String, checked: Boolean, changed: (Boolean) -> Unit) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, Modifier.weight(1f), fontSize = 13.sp)
+        FilmText(label, Modifier.weight(1f), fontSize = 13.sp)
         Switch(checked, changed)
     }
 }
@@ -484,7 +502,7 @@ private fun Badge(label: String, color: Color = paper) {
 }
 
 @Composable
-private fun Control(label: String, click: () -> Unit, selected: Boolean = false, enabled: Boolean = true) {
+internal fun Control(label: String, click: () -> Unit, selected: Boolean = false, enabled: Boolean = true) {
     val style = RoundedCornerShape(6.dp)
     Box(Modifier.clip(style).background(if (selected) brass else deck).border(1.dp, if (selected) brass else line, style)
         .clickable(enabled = enabled, role = Role.Button, onClick = click).padding(horizontal = 9.dp, vertical = 7.dp)) {
@@ -494,5 +512,5 @@ private fun Control(label: String, click: () -> Unit, selected: Boolean = false,
 
 @Composable
 private fun Engraving(label: String, color: Color, font: Int) {
-    Text(label, color = color, fontFamily = mono, fontSize = font.sp, letterSpacing = .15.sp, lineHeight = (font + 2).sp)
+    FilmText(label, color = color, fontFamily = mono, fontSize = font.sp, letterSpacing = .15.sp, lineHeight = (font + 2).sp)
 }

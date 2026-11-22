@@ -37,6 +37,17 @@ class LutRenderer(private val cubes: Map<Film, Cube>, private val onError: (Int,
     private var closing = false
     @Volatile var film = FilmRender(Film.EKTAR, Film.EKTAR.iso)
     private var grainSeed = 0
+    @Volatile internal var onLuminance: ((Int, MeteringGrid) -> Unit)? = null
+    private var meteredAt = 0L
+    private var meterReadbackFailed = false
+    private var meterInterval = 450L
+
+    internal fun requestMeteringSample(mode: MeteringMode) {
+        handler.post {
+            meteredAt = 0L
+            meterInterval = if (mode == MeteringMode.SPOT) 250L else 450L
+        }
+    }
 
     fun effect(session: Int): CameraEffect {
         val processor = object : SurfaceProcessor {
@@ -74,6 +85,16 @@ class LutRenderer(private val cubes: Map<Film, Cube>, private val onError: (Int,
                                 minOf(output.size.width, output.size.height))
                             check(eglSwapBuffers(current.display, target)) { "取景输出中断" }
                             onFrame(session)
+                            val now = android.os.SystemClock.elapsedRealtime()
+                            if (onLuminance != null && !meterReadbackFailed && now - meteredAt >= meterInterval) {
+                                meteredAt = now
+                                val sampled = runCatching { sampleLuminance(current, oes, outputMatrix, selected, now) }
+                                sampled.onSuccess { onLuminance?.invoke(session, it) }.onFailure {
+                                    meterReadbackFailed = true
+                                    glBindFramebuffer(GL_FRAMEBUFFER, 0)
+                                    for (attempt in 0 until 8) { if (glGetError() == GL_NO_ERROR) break }
+                                }
+                            }
                         }
                     }
                 } catch (error: Exception) {
@@ -97,6 +118,41 @@ class LutRenderer(private val cubes: Map<Film, Cube>, private val onError: (Int,
         }
     }
 
+    private fun sampleLuminance(current: Gpu, input: Int, matrix: FloatArray, selected: FilmRender, now: Long): MeteringGrid {
+        current.use(current.buffer)
+        val readback = current.meterReadback ?: MeterReadback().also { current.meterReadback = it }
+        try {
+            glBindFramebuffer(GL_FRAMEBUFFER, readback.framebuffer)
+            glViewport(0, 0, 32, 32)
+            draw(current, current.previewProgram, GL_TEXTURE_EXTERNAL_OES, input, matrix, selected, 32, raw = true)
+            readback.bytes.clear()
+            glReadPixels(0, 0, 32, 32, GL_RGBA, GL_UNSIGNED_BYTE, readback.bytes)
+            check(glGetError() == GL_NO_ERROR)
+            val values = FloatArray(32 * 32) { index ->
+                // OpenGL reads bottom-up; metering points use the displayed top-left origin.
+                val offset = ((31 - index / 32) * 32 + index % 32) * 4
+                val r = linearChannel(readback.bytes.get(offset).toInt() and 255)
+                val g = linearChannel(readback.bytes.get(offset + 1).toInt() and 255)
+                val b = linearChannel(readback.bytes.get(offset + 2).toInt() and 255)
+                .2126f * r + .7152f * g + .0722f * b
+            }
+            return MeteringGrid(32, values, now)
+        } finally { glBindFramebuffer(GL_FRAMEBUFFER, 0) }
+    }
+
+    private class MeterReadback {
+        val bytes: ByteBuffer = ByteBuffer.allocateDirect(32 * 32 * 4)
+        private val target = texture(GL_TEXTURE_2D).also {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 32, 32, 0, GL_RGBA, GL_UNSIGNED_BYTE, null)
+        }
+        val framebuffer = IntArray(1).also { glGenFramebuffers(1, it, 0) }[0]
+        init {
+            glBindFramebuffer(GL_FRAMEBUFFER, framebuffer)
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0)
+            check(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+        }
+    }
+
     private fun output(output: SurfaceOutput, session: Int) {
         if (closing) { output.close(); return }
         try {
@@ -111,21 +167,21 @@ class LutRenderer(private val cubes: Map<Film, Cube>, private val onError: (Int,
         }
     }
 
-    fun render(jpeg: ByteArray, rotation: Int, selected: FilmRender, edge: FilmEdge?, callback: (Result<Bitmap>) -> Unit) {
-        executor.execute { callback(runCatching { renderJpeg(jpeg, rotation, selected, edge) }) }
+    fun render(jpeg: ByteArray, rotation: Int, selected: FilmRender, edge: FilmEdge?, imprint: DateImprint?, callback: (Result<Bitmap>) -> Unit) {
+        executor.execute { callback(runCatching { renderJpeg(jpeg, rotation, selected, edge, imprint) }) }
     }
 
     @Suppress("DEPRECATION")
-    private fun renderJpeg(jpeg: ByteArray, rotation: Int, selected: FilmRender, edge: FilmEdge?): Bitmap {
+    private fun renderJpeg(jpeg: ByteArray, rotation: Int, selected: FilmRender, edge: FilmEdge?, imprint: DateImprint?): Bitmap {
         val decoder = checkNotNull(BitmapRegionDecoder.newInstance(jpeg, 0, jpeg.size, false))
         try {
-            return renderRegions(decoder, PhotoOrientation(decoder.width, decoder.height, rotation), selected, edge)
+            return renderRegions(decoder, PhotoOrientation(decoder.width, decoder.height, rotation), selected, edge, imprint)
         } finally {
             decoder.recycle()
         }
     }
 
-    private fun renderRegions(decoder: BitmapRegionDecoder, orientation: PhotoOrientation, selected: FilmRender, edge: FilmEdge?): Bitmap {
+    private fun renderRegions(decoder: BitmapRegionDecoder, orientation: PhotoOrientation, selected: FilmRender, edge: FilmEdge?, imprint: DateImprint?): Bitmap {
         val current = checkNotNull(gpu)
         current.use(current.buffer)
         val width = decoder.width
@@ -144,6 +200,7 @@ class LutRenderer(private val cubes: Map<Film, Cube>, private val onError: (Int,
         try {
             val canvas = android.graphics.Canvas(final)
             if (strip != null) canvas.drawFilmStrip(strip, edge)
+            val canvasState = canvas.save()
             canvas.translate((orientation.shiftX + (strip?.photoLeft ?: 0)).toFloat(),
                 (orientation.shiftY + (strip?.photoTop ?: 0)).toFloat())
             canvas.rotate(orientation.rotation.toFloat())
@@ -187,6 +244,13 @@ class LutRenderer(private val cubes: Map<Film, Cube>, private val onError: (Int,
                 glDeleteFramebuffers(1, framebuffer, 0)
                 deleteTextures(input, target)
             }
+            canvas.restoreToCount(canvasState)
+            imprint?.let { stamp ->
+                val left = (strip?.photoLeft ?: 0).toFloat()
+                val top = (strip?.photoTop ?: 0).toFloat()
+                canvas.drawFilmDateImprint(stamp, android.graphics.RectF(left, top,
+                    left + orientation.width, top + orientation.height), orientation.rotation)
+            }
             return final
         } catch (error: Throwable) {
             final.recycle()
@@ -195,7 +259,7 @@ class LutRenderer(private val cubes: Map<Film, Cube>, private val onError: (Int,
     }
 
     private fun draw(current: Gpu, program: Int, target: Int, image: Int, matrix: FloatArray, selected: FilmRender,
-        shortSide: Int, left: Int = 0, top: Int = 0, seed: Int = 0) {
+        shortSide: Int, left: Int = 0, top: Int = 0, seed: Int = 0, raw: Boolean = false) {
         glUseProgram(program)
         glActiveTexture(GL_TEXTURE2)
         glBindTexture(GL_TEXTURE_2D, current.grainTexture)
@@ -213,6 +277,7 @@ class LutRenderer(private val cubes: Map<Film, Cube>, private val onError: (Int,
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(target, image)
         glUniform1i(glGetUniformLocation(program, "cameraImage"), 0)
+        glUniform1i(glGetUniformLocation(program, "meterOnly"), if (raw) 1 else 0)
         glUniform1i(glGetUniformLocation(program, "lutImage"), 1)
         glUniform1i(glGetUniformLocation(program, "grainImage"), 2)
         glUniformMatrix4fv(glGetUniformLocation(program, "transform"), 1, false, matrix, 0)
@@ -257,6 +322,7 @@ class LutRenderer(private val cubes: Map<Film, Cube>, private val onError: (Int,
         val previewProgram: Int
         val stillProgram: Int
         val grainTexture: Int
+        var meterReadback: MeterReadback? = null
         init {
             use(buffer)
             previewProgram = program("#extension GL_OES_EGL_image_external_essl3 : require\n", "samplerExternalOES")
@@ -329,10 +395,12 @@ class LutRenderer(private val cubes: Map<Film, Cube>, private val onError: (Int,
                 uniform vec2 grain;
                 uniform vec2 grainOrigin;
                 uniform highp uint grainSeed;
+                uniform bool meterOnly;
                 in vec2 uv;
                 out vec4 pixel;
                 void main() {
                     vec3 incoming = texture(cameraImage, uv).rgb;
+                    if (meterOnly) { pixel = vec4(incoming, 1.); return; }
                     float edge = float(textureSize(lutImage, 0).x);
                     vec3 coord = (clamp(incoming, 0., 1.)*(edge-1.)+.5)/edge;
                     vec3 color = texture(lutImage, coord).rgb;
